@@ -1,13 +1,22 @@
 import streamlit as st
 import os
 import re
+import shutil
 import tempfile
+import zipfile
 from pathlib import Path
+import fitz  # PyMuPDF
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import io
-import fitz  # PyMuPDF
+
+# Configuração da página
+st.set_page_config(
+    page_title="Pesquisador de Credores - Falência Unick",
+    page_icon="🔍",
+    layout="wide"
+)
 
 # ============================================================================
 # CONFIGURAÇÕES
@@ -15,39 +24,28 @@ import fitz  # PyMuPDF
 FOLDER_ID = "1bSfx68JysAIY-iRH42MSNoUMXxF6U1MH"  # ID da sua pasta pública
 
 # ============================================================================
-# FUNÇÕES DO GOOGLE DRIVE
+# AUTENTICAÇÃO
 # ============================================================================
 
 def autenticar_drive():
-    """Autentica usando Service Account (para deploy) ou retorna None para teste local"""
+    """Autentica usando Service Account do Streamlit Secrets"""
     try:
-        # Tenta usar as credenciais do Streamlit Secrets
-        if "gcp_service_account" in st.secrets:
-            credentials = service_account.Credentials.from_service_account_info(
-                st.secrets["gcp_service_account"],
-                scopes=['https://www.googleapis.com/auth/drive.readonly']
-            )
-            return build('drive', 'v3', credentials=credentials)
-        else:
-            # Modo de demonstração - sem acesso real ao Drive
-            st.warning("🔧 Modo de demonstração. Configure as secrets para acesso real.")
-            return None
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        return build('drive', 'v3', credentials=credentials)
     except Exception as e:
-        st.error(f"Erro de autenticação: {e}")
+        st.error(f"❌ Erro de autenticação: {e}")
         return None
+
+# ============================================================================
+# FUNÇÕES DO GOOGLE DRIVE
+# ============================================================================
 
 def listar_pastas_raiz(drive_service, folder_id):
     """Lista as pastas dentro da pasta principal"""
     pastas = []
-    
-    if not drive_service:
-        # Dados de exemplo para demonstração
-        return [
-            {"id": "ex1", "name": "RESULTADO_ANALISADOS"},
-            {"id": "ex2", "name": "RESULTADO_SENTENCAS"},
-            {"id": "ex3", "name": "RESULTADO_CAIXA_DE_ENTRADA"}
-        ]
-    
     try:
         page_token = None
         while True:
@@ -72,14 +70,12 @@ def listar_pastas_raiz(drive_service, folder_id):
     
     return pastas
 
-def buscar_pdfs_pasta(drive_service, folder_id):
-    """Busca recursivamente por todos os PDFs em uma pasta"""
-    arquivos_pdf = []
-    
-    if not drive_service:
-        return []
-    
+def baixar_pasta_completa(drive_service, folder_id, folder_name, destino):
+    """Baixa recursivamente todos os arquivos de uma pasta"""
     try:
+        destino_path = Path(destino) / folder_name
+        destino_path.mkdir(parents=True, exist_ok=True)
+        
         page_token = None
         while True:
             response = drive_service.files().list(
@@ -91,291 +87,269 @@ def buscar_pdfs_pasta(drive_service, folder_id):
             
             for file in response.get('files', []):
                 if file['mimeType'] == 'application/vnd.google-apps.folder':
-                    # É uma subpasta: buscar recursivamente
-                    sub_pdfs = buscar_pdfs_pasta(drive_service, file['id'])
-                    arquivos_pdf.extend(sub_pdfs)
-                elif file['name'].lower().endswith('.pdf'):
-                    # É um PDF
-                    arquivos_pdf.append({
-                        'id': file['id'],
-                        'name': file['name']
-                    })
+                    baixar_pasta_completa(drive_service, file['id'], file['name'], destino_path)
+                else:
+                    request = drive_service.files().get_media(fileId=file['id'])
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                    
+                    file_path = destino_path / file['name']
+                    with open(file_path, 'wb') as f:
+                        f.write(fh.getvalue())
             
             page_token = response.get('nextPageToken', None)
             if page_token is None:
                 break
+        return True
     except Exception as e:
-        st.error(f"Erro ao buscar PDFs: {e}")
+        st.error(f"Erro ao baixar pasta {folder_name}: {e}")
+        return False
+
+# ============================================================================
+# CLASSE DO PESQUISADOR
+# ============================================================================
+
+class PesquisadorCredores:
+    def __init__(self, pasta_base, termo_busca):
+        self.pasta_base = Path(pasta_base)
+        self.termo_busca = termo_busca.upper().strip()
+        self.eh_documento = self._detectar_documento(termo_busca)
+        
+    def _detectar_documento(self, texto):
+        numeros = re.sub(r'[^0-9]', '', texto)
+        return len(numeros) == 11 or len(numeros) == 14
     
-    return arquivos_pdf
-
-def baixar_pdf_temporario(drive_service, file_id, file_name):
-    """Baixa um PDF do Drive para arquivo temporário"""
-    try:
-        request = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
+    def normalizar_texto(self, texto):
+        if not texto:
+            return ""
+        texto = texto.upper()
+        # Remove acentos
+        texto = re.sub(r'[ÁÀÂÃÄ]', 'A', texto)
+        texto = re.sub(r'[ÉÈÊË]', 'E', texto)
+        texto = re.sub(r'[ÍÌÎÏ]', 'I', texto)
+        texto = re.sub(r'[ÓÒÔÕÖ]', 'O', texto)
+        texto = re.sub(r'[ÚÙÛÜ]', 'U', texto)
+        texto = re.sub(r'Ç', 'C', texto)
+        # Remove caracteres especiais
+        texto = re.sub(r'[_\-\.,;:]', ' ', texto)
+        texto = re.sub(r'[^A-Z0-9\s]', '', texto)
+        texto = re.sub(r'\s+', ' ', texto)
+        return texto.strip()
+    
+    def extrair_numeros(self, texto):
+        return re.sub(r'[^0-9]', '', texto)
+    
+    def pasta_contem_termo(self, nome_pasta):
+        nome_norm = self.normalizar_texto(nome_pasta)
+        termo_norm = self.normalizar_texto(self.termo_busca)
         
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-        temp_file.write(fh.getvalue())
-        temp_file.close()
+        # Busca por documento (CPF/CNPJ)
+        if self.eh_documento:
+            numeros_pasta = self.extrair_numeros(nome_pasta)
+            numeros_termo = self.extrair_numeros(self.termo_busca)
+            if numeros_termo in numeros_pasta:
+                return True, "Documento corresponde"
         
-        return Path(temp_file.name)
-    except Exception as e:
-        return None
-
-def normalizar_texto(texto):
-    """Remove acentos, espaços e caracteres especiais para comparação"""
-    if not texto:
-        return ""
-    texto = texto.upper()
-    texto = re.sub(r'[ÁÀÂÃÄ]', 'A', texto)
-    texto = re.sub(r'[ÉÈÊË]', 'E', texto)
-    texto = re.sub(r'[ÍÌÎÏ]', 'I', texto)
-    texto = re.sub(r'[ÓÒÔÕÖ]', 'O', texto)
-    texto = re.sub(r'[ÚÙÛÜ]', 'U', texto)
-    texto = re.sub(r'Ç', 'C', texto)
-    texto = re.sub(r'[^A-Z0-9]', '', texto)
-    return texto
-
-def pesquisar_em_pdf(pdf_path, termo_busca):
-    """Pesquisa o termo dentro de um PDF"""
-    try:
-        doc = fitz.open(pdf_path)
-        termo_normalizado = normalizar_texto(termo_busca)
+        # Busca por nome (palavra exata)
+        palavras_nome = nome_norm.split()
+        palavras_termo = termo_norm.split()
         
-        for page_num in range(len(doc)):
-            texto = doc[page_num].get_text()
-            texto_normalizado = normalizar_texto(texto)
-            
-            if termo_normalizado in texto_normalizado:
-                doc.close()
-                return True
-        
-        doc.close()
-        return False
-    except Exception as e:
-        return False
-    finally:
+        for palavra_termo in palavras_termo:
+            if len(palavra_termo) >= 2:
+                for palavra_nome in palavras_nome:
+                    if palavra_termo == palavra_nome:
+                        return True, "Nome corresponde"
+        return False, ""
+    
+    def pesquisar_em_pdf(self, pdf_path):
         try:
-            os.unlink(pdf_path)
-        except:
+            if pdf_path.stat().st_size == 0:
+                return False
+            
+            doc = fitz.open(pdf_path)
+            termo_norm = self.normalizar_texto(self.termo_busca)
+            numeros_termo = self.extrair_numeros(self.termo_busca) if self.eh_documento else None
+            
+            for page_num in range(len(doc)):
+                texto = doc[page_num].get_text()
+                texto_norm = self.normalizar_texto(texto)
+                
+                # Busca por nome
+                if termo_norm in texto_norm:
+                    doc.close()
+                    return True
+                
+                # Busca por documento
+                if numeros_termo:
+                    texto_numeros = self.extrair_numeros(texto)
+                    if numeros_termo in texto_numeros:
+                        doc.close()
+                        return True
+            
+            doc.close()
+            return False
+        except Exception as e:
+            return False
+    
+    def buscar_recursivamente(self, pasta_atual):
+        try:
+            for item in pasta_atual.iterdir():
+                if item.is_dir():
+                    corresponde, _ = self.pasta_contem_termo(item.name)
+                    if corresponde:
+                        return item
+                    
+                    resultado = self.buscar_recursivamente(item)
+                    if resultado:
+                        return resultado
+                elif item.is_file() and item.suffix.lower() == '.pdf':
+                    if self.pesquisar_em_pdf(item):
+                        return pasta_atual
+        except Exception as e:
             pass
-
-def pasta_contem_nome(pasta_nome, termo_busca):
-    """Verifica se o nome da pasta contém o termo buscado"""
-    pasta_normalizado = normalizar_texto(pasta_nome)
-    termo_normalizado = normalizar_texto(termo_busca)
-    return termo_normalizado in pasta_normalizado
-
-def processar_pesquisa(drive_service, folder_id, termo_busca, progress_placeholder, status_placeholder):
-    """Função principal de pesquisa"""
-    resultados = []
+        return None
     
-    # Listar pastas raiz
-    status_placeholder.info("📂 Listando pastas...")
-    pastas_raiz = listar_pastas_raiz(drive_service, folder_id)
-    
-    if not pastas_raiz:
-        return [], "Nenhuma pasta encontrada"
-    
-    total_pastas = len(pastas_raiz)
-    
-    for idx, pasta in enumerate(pastas_raiz):
-        # Atualizar progresso
-        progresso_atual = (idx + 1) / total_pastas
-        progress_placeholder.progress(progresso_atual)
-        status_placeholder.info(f"🔍 Analisando: {pasta['name']} ({idx+1}/{total_pastas})")
+    def processar(self, progress_callback=None):
+        pastas_raiz = [p for p in self.pasta_base.iterdir() if p.is_dir()]
         
-        # Verificar se o nome da pasta já contém a busca
-        if pasta_contem_nome(pasta['name'], termo_busca):
-            resultados.append({
-                'pasta': pasta['name'],
-                'pasta_id': pasta['id'],
-                'motivo': '✅ Nome da pasta corresponde'
-            })
-            continue
-        
-        # Se não, buscar PDFs e verificar conteúdo
-        if drive_service:
-            status_placeholder.info(f"📄 Buscando PDFs em: {pasta['name']}...")
-            pdfs = buscar_pdfs_pasta(drive_service, pasta['id'])
+        resultados = []
+        for idx, pasta_raiz in enumerate(pastas_raiz):
+            if progress_callback:
+                progress_callback(idx + 1, len(pastas_raiz), pasta_raiz.name)
             
-            encontrado = False
-            for pdf in pdfs:
-                status_placeholder.info(f"📖 Lendo: {pdf['name']}...")
-                pdf_path = baixar_pdf_temporario(drive_service, pdf['id'], pdf['name'])
-                if pdf_path and pesquisar_em_pdf(pdf_path, termo_busca):
-                    resultados.append({
-                        'pasta': pasta['name'],
-                        'pasta_id': pasta['id'],
-                        'motivo': f'✅ Encontrado no PDF: {pdf["name"]}'
-                    })
-                    encontrado = True
-                    break
-            
-            if not encontrado:
+            pasta_encontrada = self.buscar_recursivamente(pasta_raiz)
+            if pasta_encontrada:
                 resultados.append({
-                    'pasta': pasta['name'],
-                    'pasta_id': pasta['id'],
-                    'motivo': '❌ Nome não encontrado'
+                    'termo': self.termo_busca,
+                    'pasta': pasta_encontrada.name,
+                    'caminho': str(pasta_encontrada.relative_to(self.pasta_base))
                 })
-        else:
-            # Modo demonstração
-            resultados.append({
-                'pasta': pasta['name'],
-                'pasta_id': pasta['id'],
-                'motivo': '🔧 Modo demonstração (configure secrets para acesso real)'
-            })
-    
-    return resultados, None
+        
+        return resultados
 
 # ============================================================================
 # INTERFACE STREAMLIT
 # ============================================================================
 
-st.set_page_config(
-    page_title="Pesquisador de Credores - Falência Unick",
-    page_icon="🔍",
-    layout="wide"
-)
-
-# CSS personalizado
-st.markdown("""
-<style>
-    .main-header {
-        background-color: #2c3e50;
-        padding: 1rem;
-        border-radius: 10px;
-        margin-bottom: 2rem;
-    }
-    .result-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 8px;
-        margin-bottom: 0.5rem;
-    }
-    .success {
-        color: #27ae60;
-        font-weight: bold;
-    }
-    .info {
-        color: #2980b9;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Título
-st.markdown('<div class="main-header">', unsafe_allow_html=True)
 st.title("🔍 Pesquisador de Credores")
 st.markdown("### Falência Unick - Habilitação de Crédito")
-st.markdown(f'<p class="info">📁 Pasta conectada: <code>TESTEEMAIL_ARQUIVOS</code></p>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
 
-# Sidebar
 with st.sidebar:
     st.markdown("## 📋 Instruções")
     st.markdown("""
-    1. **Digite o nome** do credor que deseja buscar
+    1. **Digite os termos** separados por vírgula
     2. **Clique em Pesquisar**
-    3. **Aguarde** o processamento (pode levar alguns minutos)
-    4. **Veja os resultados** na tela
-    
-    ---
-    
-    ### 💡 Dicas:
-    - A busca ignora maiúsculas/minúsculas
-    - Remove acentos automaticamente
-    - Busca em nomes de pastas e dentro de PDFs
-    - Quanto mais PDFs, mais demorado
-    
-    ---
-    
-    ### 📁 Acesso:
-    - [Abrir pasta no Google Drive](https://drive.google.com/drive/folders/1bSfx68JysAIY-iRH42MSNoUMXxF6U1MH)
+    3. **Aguarde** o processamento
+    4. **Baixe** os resultados
     """)
     
     st.markdown("---")
-    st.caption("Sistema de busca para credores da Falência Unick")
+    st.markdown("### 💡 Exemplos:")
+    st.code("""
+01710455055, 08429728899
+Adao Andrade, Albert
+    """)
+    
+    st.markdown("---")
+    st.markdown("### 📁 Pasta conectada:")
+    st.code("TESTEEMAIL_ARQUIVOS (Google Drive)")
 
-# Campo de busca
-col1, col2 = st.columns([3, 1])
+# Entrada de termos
+termos_input = st.text_area(
+    "🔍 **Digite os termos separados por vírgula**",
+    placeholder="Ex: 01710455055, Adao Andrade, Albert",
+    height=100
+)
 
-with col1:
-    nome_busca = st.text_input(
-        "🔍 **Nome do credor**",
-        placeholder="Ex: CLEUSA RODRIGUES, CLAUDIA ONEIDE GOLLMANN, ADRIANO CHAVES",
-        help="Digite o nome completo ou parcial do credor"
-    )
-
-with col2:
-    st.markdown("### ")
-    pesquisar = st.button("🔍 PESQUISAR", type="primary", use_container_width=True)
-
-# Área de resultados
-if pesquisar:
-    if not nome_busca:
-        st.error("❌ **Erro:** Digite o nome do credor!")
+if st.button("🔍 PESQUISAR", type="primary", use_container_width=True):
+    if not termos_input.strip():
+        st.error("❌ Digite pelo menos um termo!")
     else:
-        # Placeholders para progresso
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        resultados_container = st.container()
+        termos = [t.strip() for t in termos_input.split(',') if t.strip()]
         
-        try:
-            # Autenticar
-            drive_service = autenticar_drive()
+        st.info(f"📋 {len(termos)} termo(s) para pesquisar")
+        
+        with st.expander("📋 Ver termos"):
+            for i, t in enumerate(termos, 1):
+                st.write(f"{i}. {t}")
+        
+        # Autenticar
+        drive_service = autenticar_drive()
+        
+        if not drive_service:
+            st.error("❌ Erro ao conectar ao Google Drive. Verifique as Secrets.")
+        else:
+            # Criar pasta temporária
+            temp_dir = tempfile.mkdtemp()
             
-            # Executar pesquisa
-            resultados, erro = processar_pesquisa(
-                drive_service, 
-                FOLDER_ID, 
-                nome_busca, 
-                progress_bar, 
-                status_text
-            )
+            with st.spinner("📥 Baixando dados do Google Drive (pode levar alguns minutos)..."):
+                # Listar pastas raiz
+                pastas_raiz = listar_pastas_raiz(drive_service, FOLDER_ID)
+                
+                if not pastas_raiz:
+                    st.error("❌ Nenhuma pasta encontrada no Drive")
+                else:
+                    # Baixar cada pasta raiz
+                    for pasta in pastas_raiz:
+                        baixar_pasta_completa(drive_service, pasta['id'], pasta['name'], temp_dir)
+                    
+                    st.success("✅ Dados baixados com sucesso!")
+            
+            # Processar cada termo
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            resultados_container = st.empty()
+            
+            todos_resultados = []
+            
+            for idx, termo in enumerate(termos):
+                status_text.info(f"🔍 Pesquisando: {termo} ({idx+1}/{len(termos)})")
+                
+                def atualizar_progresso(atual, total, pasta_atual):
+                    percentual = (idx + (atual/total)) / len(termos)
+                    progress_bar.progress(percentual)
+                    status_text.info(f"📁 {pasta_atual} - {termo}")
+                
+                pesquisador = PesquisadorCredores(temp_dir, termo)
+                resultados = pesquisador.processar(atualizar_progresso)
+                todos_resultados.extend(resultados)
             
             progress_bar.progress(1.0)
+            status_text.success("✅ Pesquisa concluída!")
             
-            if erro:
-                status_text.error(f"❌ {erro}")
+            if todos_resultados:
+                resultados_container.success(f"✅ **ENCONTRADOS!** {len(todos_resultados)} resultado(s)")
+                
+                # Mostrar resultados
+                for item in todos_resultados:
+                    with st.expander(f"📁 {item['pasta']} - Termo: {item['termo']}"):
+                        st.write(f"**Caminho:** {item['caminho']}")
+                
+                # Criar ZIP com resultados
+                zip_path = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+                with zipfile.ZipFile(zip_path.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(temp_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, temp_dir)
+                            zipf.write(file_path, arcname)
+                
+                with open(zip_path.name, 'rb') as f:
+                    st.download_button(
+                        label="📥 BAIXAR RESULTADOS (ZIP)",
+                        data=f,
+                        file_name="resultados_encontrados.zip",
+                        mime="application/zip",
+                        use_container_width=True
+                    )
+                
+                # Limpar arquivo temporário
+                os.unlink(zip_path.name)
             else:
-                # Separar resultados encontrados e não encontrados
-                encontrados = [r for r in resultados if "✅" in r['motivo']]
-                nao_encontrados = [r for r in resultados if "❌" in r['motivo']]
-                
-                with resultados_container:
-                    if encontrados:
-                        st.success(f"✅ **ENCONTRADO!** ({len(encontrados)} pasta(s))")
-                        
-                        st.markdown("### 📋 Pastas encontradas:")
-                        for item in encontrados:
-                            with st.expander(f"📁 {item['pasta']}"):
-                                st.markdown(f"**Status:** {item['motivo']}")
-                                st.markdown(f"**ID da pasta:** `{item['pasta_id']}`")
-                    else:
-                        st.warning(f"❌ **NENHUMA pasta encontrada** com o nome '{nome_busca}'")
-                        st.info("💡 **Dica:** Verifique se o nome está correto ou tente com variações")
-                    
-                    if nao_encontrados and len(nao_encontrados) > 0:
-                        with st.expander(f"📁 Pastas verificadas ({len(nao_encontrados)} sem correspondência)"):
-                            for item in nao_encontrados:
-                                st.markdown(f"- **{item['pasta']}**: {item['motivo']}")
-                
-                status_text.success(f"✅ Pesquisa concluída! Processadas {len(resultados)} pastas.")
-                
-        except Exception as e:
-            status_text.error(f"❌ **Erro durante a pesquisa:** {str(e)}")
-            st.info("Tente novamente ou verifique se a pasta está acessível")
-
-# Informações adicionais
-st.markdown("---")
-st.markdown("### ℹ️ Sobre o sistema")
-st.markdown("""
-- **Busca inteligente:** Encontra o nome mesmo com acentos, maiúsculas/minúsculas diferentes
-- **Modo de demonstração:** Se as credenciais não estiverem configuradas, o sistema mostra dados de exemplo
-- **Privacidade:** Apenas leitura dos arquivos, nada é alterado ou excluído
-""")
+                resultados_container.warning("❌ Nenhum resultado encontrado")
+            
+            # Limpar pasta temporária
+            shutil.rmtree(temp_dir, ignore_errors=True)
